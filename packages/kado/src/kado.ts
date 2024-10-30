@@ -3,42 +3,81 @@ import { urandom } from '@daisugi/kintsugi';
 
 const { errFn } = new Ayamari();
 
-interface Class {
-  // biome-ignore lint/suspicious/noConfusingVoidType: This is a class constructor.
-  new (...args: any[]): void;
-}
+type ClassConstructor = new (...args: any) => any;
+type Callback<R> = (...args: any) => R;
+
+type MappedArray<T extends unknown[], U> = {
+  [K in keyof T]: KadoManifestItem<T[K]> | U;
+};
+
 export type KadoToken = string | symbol | number;
 export type KadoScope = 'Transient' | 'Singleton';
-export interface KadoManifestItem {
+interface KadoBaseManifestItem {
   token?: KadoToken;
-  useClass?: Class;
-  useValue?: any;
-  useFnByContainer?(container: KadoContainer): any;
-  useFn?(...args: any[]): any;
-  params?: KadoParam[];
   scope?: KadoScope;
-  meta?: Record<string, any>;
+  meta?: Record<string, unknown>;
 }
-export type KadoParam = KadoToken | KadoManifestItem;
-interface KadoContainerItem {
-  manifestItem: KadoManifestItem;
+type KadoManifestItemType = ClassConstructor | unknown;
+interface KadoClassManifestItem<C extends ClassConstructor>
+  extends KadoBaseManifestItem {
+  useClass: C;
+  params: MappedArray<ConstructorParameters<C>, KadoToken>;
+}
+interface KadoFunctionManifestItem<
+  V,
+  C extends Callback<V> = Callback<V>,
+> extends KadoBaseManifestItem {
+  useFn: C;
+  params: MappedArray<Parameters<C>, KadoToken>;
+}
+interface KadoFunctionByContainerManifestItem<V>
+  extends KadoBaseManifestItem {
+  useFnByContainer: (container: KadoContainer<V>) => V;
+  params: MappedArray<[KadoContainer<V>], KadoToken>;
+}
+interface KadoValueManifestItem<V>
+  extends KadoBaseManifestItem {
+  useValue: V;
+}
+type KadoManifestItem<
+  V extends ClassConstructor | unknown,
+> = V extends ClassConstructor
+  ? KadoClassManifestItem<V>
+  :
+      | KadoFunctionManifestItem<V>
+      | KadoFunctionByContainerManifestItem<V>
+      | KadoValueManifestItem<V>;
+
+export type KadoParam<V> = KadoManifestItem<V>;
+interface KadoContainerItem<V> {
+  manifestItem: KadoManifestItem<V>;
   checkedForCircularDep: boolean;
   instance: any;
 }
-type KadoTokenToContainerItem = Map<
+type KadoTokenToContainerItem<V> = Map<
   KadoToken,
-  KadoContainerItem
+  KadoContainerItem<V>
 >;
-export type KadoContainer = Container;
+export type KadoContainer<V> = Container<V>;
 
-export class Container {
-  #tokenToContainerItem: KadoTokenToContainerItem;
+/**
+ * @example
+ * type W = WrappedManifestEntries<[typeof A, typeof B]>
+ * // returns [ManifestEntry<typeof A>, ManifestEntry<typeof B>] */
+type WrappedManifestEntries<
+  C extends KadoManifestItemType[],
+> = {
+  [K in keyof C]: KadoManifestItem<C[K]>;
+};
+
+export class Container<V> {
+  #tokenToContainerItem: KadoTokenToContainerItem<V>;
 
   constructor() {
     this.#tokenToContainerItem = new Map();
   }
 
-  async resolve<T>(token: KadoToken): Promise<T> {
+  async resolve<V>(token: KadoToken): Promise<V> {
     const containerItem =
       this.#tokenToContainerItem.get(token);
     if (containerItem === undefined) {
@@ -47,8 +86,11 @@ export class Container {
       );
     }
     const manifestItem = containerItem.manifestItem;
-    if (manifestItem.useValue !== undefined) {
-      return manifestItem.useValue;
+    if (
+      'useValue' in manifestItem &&
+      manifestItem.useValue !== undefined
+    ) {
+      return manifestItem.useValue as V;
     }
     if (containerItem.instance) {
       return containerItem.instance;
@@ -60,7 +102,7 @@ export class Container {
       });
     }
     let paramsInstances = null;
-    if (manifestItem.params) {
+    if ('params' in manifestItem && manifestItem.params) {
       this.#checkForCircularDep(containerItem);
       paramsInstances = await Promise.all(
         manifestItem.params.map(
@@ -69,13 +111,19 @@ export class Container {
       );
     }
     let instance;
-    if (manifestItem.useFn) {
+    if ('useFn' in manifestItem && manifestItem.useFn) {
       instance = paramsInstances
         ? manifestItem.useFn(...paramsInstances)
         : manifestItem.useFn();
-    } else if (manifestItem.useFnByContainer) {
+    } else if (
+      'useFnByContainer' in manifestItem &&
+      manifestItem.useFnByContainer
+    ) {
       instance = manifestItem.useFnByContainer(this);
-    } else if (manifestItem.useClass) {
+    } else if (
+      'useClass' in manifestItem &&
+      manifestItem.useClass
+    ) {
       instance = paramsInstances
         ? new manifestItem.useClass(...paramsInstances)
         : new manifestItem.useClass();
@@ -87,21 +135,23 @@ export class Container {
     return containerItem.instance;
   }
 
-  async #resolveParam(param: KadoParam) {
+  async #resolveParam(param: KadoParam<V>) {
     const token =
       typeof param === 'object'
         ? this.#registerItem(param)
         : param;
-    return this.resolve(token);
+    return this.resolve<V>(token);
   }
 
-  register(manifestItems: KadoManifestItem[]) {
+  register(manifestItems: KadoManifestItem<V>[]) {
     for (const manifestItem of manifestItems) {
       this.#registerItem(manifestItem);
     }
   }
 
-  #registerItem(manifestItem: KadoManifestItem): KadoToken {
+  #registerItem(
+    manifestItem: KadoManifestItem<V>,
+  ): KadoToken {
     const token = manifestItem.token || urandom();
     this.#tokenToContainerItem.set(token, {
       manifestItem: Object.assign(manifestItem, { token }),
@@ -111,13 +161,13 @@ export class Container {
     return token;
   }
 
-  list(): KadoManifestItem[] {
+  list(): KadoManifestItem<V>[] {
     return Array.from(
       this.#tokenToContainerItem.values(),
     ).map((containerItem) => containerItem.manifestItem);
   }
 
-  get(token: KadoToken): KadoManifestItem {
+  get(token: KadoToken): KadoManifestItem<V> {
     const containerItem =
       this.#tokenToContainerItem.get(token);
     if (containerItem === undefined) {
@@ -129,7 +179,7 @@ export class Container {
   }
 
   #checkForCircularDep(
-    containerItem: KadoContainerItem,
+    containerItem: KadoContainerItem<V>,
     tokens: KadoToken[] = [],
   ) {
     if (containerItem.checkedForCircularDep) {
@@ -147,7 +197,10 @@ export class Container {
         `Attempted to resolve circular dependency: ${chainOfTokens} 🔄 "${token.toString()}".`,
       );
     }
-    if (containerItem.manifestItem.params) {
+    if (
+      'params' in containerItem.manifestItem &&
+      containerItem.manifestItem.params
+    ) {
       for (const param of containerItem.manifestItem
         .params) {
         if (typeof param === 'object') {
@@ -168,36 +221,61 @@ export class Container {
   }
 }
 
-export class Kado {
+export class Kado<V> {
   static scope: Record<KadoScope, KadoScope> = {
     Transient: 'Transient',
     Singleton: 'Singleton',
   };
-  container: KadoContainer;
+  container: KadoContainer<V>;
 
   constructor() {
     this.container = new Container();
   }
 
-  static value(value: unknown): KadoManifestItem {
+  static value<V>(value: V): KadoValueManifestItem<V> {
     return { useValue: value };
   }
 
-  static map(params: KadoParam[]): KadoManifestItem {
-    return {
-      useFn(...args: unknown[]) {
+  static map<P extends unknown[]>(
+    params: { [K in keyof P]: KadoParam<P[K]> },
+  ): KadoFunctionManifestItem<P> {
+    return Kado.useFn({
+      useFn(...args: P) {
         return args;
       },
       params,
-    };
+    });
   }
 
-  static flatMap(params: KadoParam[]): KadoManifestItem {
-    return {
-      useFn(...args: unknown[]) {
-        return args.flat();
+  static flatMap<P extends unknown[]>(
+    params: { [K in keyof P]: KadoParam<P[K]> },
+  ): KadoFunctionManifestItem<P> {
+    return Kado.useFn({
+      useFn(...args: P) {
+        return args.flat() as P;
       },
       params,
-    };
+    });
+  }
+
+  /** Type-checks a manifest item array. */
+  static manifest<C extends KadoManifestItemType[]>(
+    entries: WrappedManifestEntries<C>,
+  ) {
+    return entries;
+  }
+
+  /** Type-checks a manifest item. */
+  static manifestItem<C extends ClassConstructor>(
+    entry: KadoManifestItem<C>,
+  ) {
+    return entry;
+  }
+
+  /** Type-checks a function manifest item. */
+  static useFn<V, C extends Callback<V>>(
+    entry: KadoFunctionManifestItem<V, C>,
+  ) {
+    return entry;
   }
 }
